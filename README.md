@@ -535,24 +535,7 @@ For more troubleshooting, see [Backend Troubleshooting Guide](./smart-campus-bac
 
 ---
 
-## 📞 Support
 
-### Team
-
-**Smart Campus Team** 
-- Mann
-- Kanav
-- Kavya
-- Kirtan
-
-### Contact
-
-- **GitHub Issues**: [Report a bug](https://github.com/KanavCode/smart-campus-utility-hub/issues)
-- **Discussions**: [Ask questions](https://github.com/KanavCode/smart-campus-utility-hub/discussions)
-
----
-
----
 
 ## 🙏 Acknowledgments
 
