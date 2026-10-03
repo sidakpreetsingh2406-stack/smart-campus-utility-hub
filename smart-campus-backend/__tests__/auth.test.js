@@ -1,0 +1,483 @@
+/**
+ * Authentication API Tests
+ * Tests user registration, login, and profile management
+ */
+
+
+const request = require('supertest');
+const crypto = require('crypto');
+const app = require('../src/app');
+
+// Mock the database module to avoid actual DB connections during tests
+jest.mock('../src/config/db', () => ({
+  query: jest.fn(),
+  transaction: jest.fn(),
+  testConnection: jest.fn().mockResolvedValue(true),
+  logger: {
+    info: jest.fn(),
+    error: jest.fn(),
+    warn: jest.fn(),
+    debug: jest.fn()
+  }
+}));
+
+const { query } = require('../src/config/db');
+const findCookie = (cookies = [], name) => cookies.find((cookie) => cookie.startsWith(`${name}=`));
+
+describe('Authentication API Tests', () => {
+  let testUserId;
+
+  beforeEach(() => {
+    jest.resetAllMocks();
+  });
+
+  describe('POST /api/auth/register', () => {
+    test('should register a new user successfully', async () => {
+      // Mock database responses: first for checking existing user, then for creating user
+      query.mockResolvedValueOnce({ rows: [] }); // No existing user
+      query.mockResolvedValueOnce({
+        rows: [
+          {
+            id: 1,
+            full_name: 'Test User',
+            email: 'test@example.com',
+            role: 'student',
+            department: 'Computer Science',
+            created_at: new Date()
+          }
+        ]
+      });
+      query.mockResolvedValueOnce({ rowCount: 1 });
+
+      const response = await request(app)
+        .post('/api/auth/register')
+        .send({
+          full_name: 'Test User',
+          email: 'test@example.com',
+          password: 'password123',
+          role: 'student',
+          department: 'Computer Science',
+          cgpa: 8.5,
+          semester: 5
+        });
+
+      expect(response.status).toBe(201);
+      expect(response.body.success).toBe(true);
+      expect(response.body.data.user).toBeDefined();
+      expect(response.body.data.token).toBeUndefined();
+      expect(response.headers['set-cookie']).toBeDefined();
+      expect(response.body.data.user.email).toBe('test@example.com');
+    });
+
+    test('should reject registration with invalid email', async () => {
+      const response = await request(app)
+        .post('/api/auth/register')
+        .send({
+          full_name: 'Test User',
+          email: 'invalid-email',
+          password: 'password123'
+        });
+
+      expect(response.status).toBe(400);
+      expect(response.body.success).toBe(false);
+    });
+
+    test('should reject registration with short password', async () => {
+      const response = await request(app)
+        .post('/api/auth/register')
+        .send({
+          full_name: 'Test User',
+          email: 'test@example.com',
+          password: '123'
+        });
+
+      expect(response.status).toBe(400);
+      expect(response.body.success).toBe(false);
+    });
+
+    test('should reject duplicate email registration', async () => {
+      // Mock finding existing user
+      query.mockResolvedValueOnce({
+        rows: [{ id: 1, email: 'test@example.com' }]
+      });
+
+      const response = await request(app)
+        .post('/api/auth/register')
+        .send({
+          full_name: 'Test User',
+          email: 'test@example.com',
+          password: 'password123'
+        });
+
+      expect(response.status).toBe(409);
+      expect(response.body.success).toBe(false);
+    });
+  });
+
+  describe('POST /api/auth/login', () => {
+    test('should login with valid credentials', async () => {
+      const bcrypt = require('bcryptjs');
+      const hashedPassword = await bcrypt.hash('password123', 10);
+
+      // Mock finding user with password
+      query.mockResolvedValueOnce({
+        rows: [
+          {
+            id: 1,
+            full_name: 'Test User',
+            email: 'test@example.com',
+            password_hash: hashedPassword,
+            role: 'student',
+            is_active: true,
+            created_at: new Date()
+          }
+        ]
+      });
+      query.mockResolvedValueOnce({ rowCount: 1 });
+
+      const response = await request(app)
+        .post('/api/auth/login')
+        .send({
+          email: 'test@example.com',
+          password: 'password123'
+        });
+
+      expect(response.status).toBe(200);
+      expect(response.body.success).toBe(true);
+      expect(response.body.data.token).toBeUndefined();
+      expect(response.headers['set-cookie']).toBeDefined();
+      expect(findCookie(response.headers['set-cookie'], 'accessToken')).toBeDefined();
+      expect(findCookie(response.headers['set-cookie'], 'refreshToken')).toBeDefined();
+      expect(response.body.data.user.email).toBe('test@example.com');
+      
+      testUserId = response.body.data.user.id;
+    });
+
+    test('should reject login with invalid email', async () => {
+      // Mock no user found
+      query.mockResolvedValueOnce({ rows: [] });
+
+      const response = await request(app)
+        .post('/api/auth/login')
+        .send({
+          email: 'nonexistent@example.com',
+          password: 'password123'
+        });
+
+      expect(response.status).toBe(401);
+      expect(response.body.success).toBe(false);
+    });
+
+    test('should reject login with incorrect password', async () => {
+      const bcrypt = require('bcryptjs');
+      const hashedPassword = await bcrypt.hash('correctpassword', 10);
+
+      query.mockResolvedValueOnce({
+        rows: [
+          {
+            id: 1,
+            email: 'test@example.com',
+            password_hash: hashedPassword,
+            is_active: true
+          }
+        ]
+      });
+
+      const response = await request(app)
+        .post('/api/auth/login')
+        .send({
+          email: 'test@example.com',
+          password: 'wrongpassword'
+        });
+
+      expect(response.status).toBe(401);
+      expect(response.body.success).toBe(false);
+    });
+  });
+
+  describe('GET /api/auth/profile', () => {
+    test('should get profile with valid token', async () => {
+      // Generate a valid token
+      const { generateToken } = require('../src/middleware/auth.middleware');
+      const token = generateToken({ id: 1, email: 'test@example.com', role: 'student' });
+
+      // Mock finding user
+      query.mockResolvedValueOnce({
+        rows: [
+          {
+            id: 1,
+            full_name: 'Test User',
+            email: 'test@example.com',
+            role: 'student',
+            department: 'Computer Science',
+            cgpa: 8.5
+          }
+        ]
+      });
+
+      const response = await request(app)
+        .get('/api/auth/profile')
+        .set('Authorization', `Bearer ${token}`);
+
+      expect(response.status).toBe(200);
+      expect(response.body.success).toBe(true);
+      expect(response.body.data.user).toBeDefined();
+    });
+
+    test('should reject request without token', async () => {
+      const response = await request(app)
+        .get('/api/auth/profile');
+
+      expect(response.status).toBe(401);
+      expect(response.body.success).toBe(false);
+    });
+
+    test('should reject request with invalid token', async () => {
+      const response = await request(app)
+        .get('/api/auth/profile')
+        .set('Authorization', 'Bearer invalid_token');
+
+      expect(response.status).toBe(401);
+      expect(response.body.success).toBe(false);
+      expect(response.body.message).toBe('Unauthorized: Invalid token.');
+    });
+  });
+
+  describe('POST /api/auth/refresh', () => {
+    test('should rotate access and refresh tokens with valid refresh token', async () => {
+      const { generateRefreshToken } = require('../src/middleware/auth.middleware');
+      const refreshToken = generateRefreshToken({ id: 1, tokenVersion: 'v1' });
+      const refreshTokenHash = crypto.createHash('sha256').update(refreshToken).digest('hex');
+
+      query.mockResolvedValueOnce({
+        rows: [
+          {
+            id: 1,
+            email: 'test@example.com',
+            role: 'student',
+            is_active: true,
+            refresh_token_hash: refreshTokenHash,
+            refresh_token_expires_at: new Date(Date.now() + 60 * 60 * 1000),
+          },
+        ],
+      });
+      query.mockResolvedValueOnce({ rowCount: 1 });
+
+      const response = await request(app)
+        .post('/api/auth/refresh')
+        .set('Cookie', [`refreshToken=${encodeURIComponent(refreshToken)}`]);
+
+      expect(response.status).toBe(200);
+      expect(response.body.success).toBe(true);
+      expect(response.headers['set-cookie']).toBeDefined();
+      expect(findCookie(response.headers['set-cookie'], 'accessToken')).toBeDefined();
+      expect(findCookie(response.headers['set-cookie'], 'refreshToken')).toBeDefined();
+    });
+
+    test('should reject refresh with invalid refresh token', async () => {
+      const response = await request(app)
+        .post('/api/auth/refresh')
+        .set('Cookie', ['refreshToken=invalid-token']);
+
+      expect(response.status).toBe(401);
+      expect(response.body.success).toBe(false);
+    });
+
+    test('should reject rotated refresh token and revoke stored state', async () => {
+      const { generateRefreshToken } = require('../src/middleware/auth.middleware');
+      const refreshToken = generateRefreshToken({ id: 1, tokenVersion: 'v1' });
+
+      query.mockResolvedValueOnce({
+        rows: [
+          {
+            id: 1,
+            email: 'test@example.com',
+            role: 'student',
+            is_active: true,
+            refresh_token_hash: 'different-hash',
+            refresh_token_expires_at: new Date(Date.now() + 60 * 60 * 1000),
+          },
+        ],
+      });
+      query.mockResolvedValueOnce({ rowCount: 1 });
+
+      const response = await request(app)
+        .post('/api/auth/refresh')
+        .set('Cookie', [`refreshToken=${encodeURIComponent(refreshToken)}`]);
+
+      expect(response.status).toBe(401);
+      expect(response.body.success).toBe(false);
+    });
+  });
+
+  describe('PUT /api/auth/profile', () => {
+    test('should update profile with valid data', async () => {
+      const { generateToken } = require('../src/middleware/auth.middleware');
+      const token = generateToken({ id: 1, email: 'test@example.com', role: 'student' });
+
+      // Mock update query
+      query.mockResolvedValueOnce({
+        rows: [
+          {
+            id: 1,
+            full_name: 'Updated Name',
+            email: 'test@example.com',
+            role: 'student',
+            cgpa: 9.0,
+            updated_at: new Date()
+          }
+        ]
+      });
+
+      const response = await request(app)
+        .put('/api/auth/profile')
+        .set('Authorization', `Bearer ${token}`)
+        .send({
+          full_name: 'Updated Name',
+          cgpa: 9.0
+        });
+
+      expect(response.status).toBe(200);
+      expect(response.body.success).toBe(true);
+      expect(response.body.data.user.full_name).toBe('Updated Name');
+    });
+  });
+
+  describe('Admin Routes', () => {
+    test('should allow admin to get all users', async () => {
+      const { generateToken } = require('../src/middleware/auth.middleware');
+      const adminToken = generateToken({ id: 2, email: 'admin@example.com', role: 'admin' });
+
+      query.mockResolvedValueOnce({
+        rows: [
+          { id: 1, full_name: 'User 1', email: 'user1@example.com', role: 'student' },
+          { id: 2, full_name: 'Admin', email: 'admin@example.com', role: 'admin' }
+        ]
+      });
+
+      const response = await request(app)
+        .get('/api/users')
+        .set('Authorization', `Bearer ${adminToken}`);
+
+      expect(response.status).toBe(200);
+      expect(response.body.success).toBe(true);
+      expect(response.body.data.users).toBeInstanceOf(Array);
+    });
+
+    test('should reject non-admin from accessing admin routes', async () => {
+      const { generateToken } = require('../src/middleware/auth.middleware');
+      const studentToken = generateToken({ id: 1, email: 'student@example.com', role: 'student' });
+
+      const response = await request(app)
+        .get('/api/users')
+        .set('Authorization', `Bearer ${studentToken}`);
+
+      expect(response.status).toBe(403);
+      expect(response.body.success).toBe(false);
+    });
+
+    test('should allow admin to fetch system settings', async () => {
+      const { generateToken } = require('../src/middleware/auth.middleware');
+      const adminToken = generateToken({ id: 2, email: 'admin@example.com', role: 'admin' });
+
+      query.mockResolvedValueOnce({
+        rows: [
+          {
+            academic_year: '2024-2025',
+            current_semester: 'Fall',
+            campus_name: 'Smart Campus University'
+          }
+        ]
+      });
+
+      const response = await request(app)
+        .get('/api/settings')
+        .set('Authorization', `Bearer ${adminToken}`);
+
+      expect(response.status).toBe(200);
+      expect(response.body.success).toBe(true);
+      expect(response.body.data.settings.academic_year).toBe('2024-2025');
+    });
+
+    test('should allow admin to update system settings', async () => {
+      const { generateToken } = require('../src/middleware/auth.middleware');
+      const adminToken = generateToken({ id: 2, email: 'admin@example.com', role: 'admin' });
+
+      query.mockResolvedValueOnce({
+        rows: [
+          {
+            academic_year: '2025-2026',
+            current_semester: 'Spring',
+            campus_name: 'Smart Campus University'
+          }
+        ]
+      });
+
+      const response = await request(app)
+        .put('/api/settings')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({
+          academic_year: '2025-2026',
+          current_semester: 'Spring',
+          campus_name: 'Smart Campus University'
+        });
+
+      expect(response.status).toBe(200);
+      expect(response.body.success).toBe(true);
+      expect(response.body.data.settings.current_semester).toBe('Spring');
+    });
+
+    test('should validate settings payload for admin updates', async () => {
+      const { generateToken } = require('../src/middleware/auth.middleware');
+      const adminToken = generateToken({ id: 2, email: 'admin@example.com', role: 'admin' });
+
+      const response = await request(app)
+        .put('/api/settings')
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({
+          academic_year: '2025',
+          current_semester: 'Monsoon',
+          campus_name: ''
+        });
+
+      expect(response.status).toBe(400);
+      expect(response.body.success).toBe(false);
+    });
+  });
+
+  describe('POST /api/auth/logout', () => {
+    test('should clear auth cookies and revoke refresh token state', async () => {
+      const refreshToken = 'sample-refresh-token';
+      query.mockResolvedValueOnce({ rowCount: 1 });
+
+      const response = await request(app)
+        .post('/api/auth/logout')
+        .set('Cookie', [`refreshToken=${encodeURIComponent(refreshToken)}`]);
+
+      expect(response.status).toBe(200);
+      expect(response.body.success).toBe(true);
+      expect(response.headers['set-cookie']).toBeDefined();
+      expect(findCookie(response.headers['set-cookie'], 'accessToken')).toBeDefined();
+      expect(findCookie(response.headers['set-cookie'], 'refreshToken')).toBeDefined();
+    });
+  });
+});
+
+describe('Health Check', () => {
+  test('GET /health should return server status', async () => {
+    const response = await request(app).get('/health');
+    
+    expect(response.status).toBe(200);
+    expect(response.body.success).toBe(true);
+    expect(response.body.status).toBe('OK');
+  });
+});
+
+describe('404 Handler', () => {
+  test('should return 404 for non-existent routes', async () => {
+    const response = await request(app).get('/api/nonexistent');
+    
+    expect(response.status).toBe(404);
+    expect(response.body.success).toBe(false);
+  });
+});

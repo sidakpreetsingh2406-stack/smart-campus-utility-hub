@@ -1,0 +1,67 @@
+﻿class ConflictDetector {
+  constructor(timetable, teacherSchedule, roomSchedule, groupSchedule) {
+    this.timetable = timetable;
+    this.teacherSchedule = teacherSchedule;
+    this.roomSchedule = roomSchedule;
+    this.groupSchedule = groupSchedule;
+  }
+
+  async detectConflicts(teacher, subject, group, room, day, timeSlot) {
+    const conflicts = [];
+
+    if (this.teacherSchedule && this.teacherSchedule[day] && this.teacherSchedule[day][timeSlot]) {
+      if (this.teacherSchedule[day][timeSlot].has(teacher.id)) {
+        conflicts.push({
+          type: 'TEACHER_CONFLICT',
+          severity: 'HIGH',
+          message: `Teacher ${teacher.full_name} is already scheduled`,
+          conflictingEntry: { teacherId: teacher.id, day, timeSlot }
+        });
+      }
+    }
+
+    if (this.roomSchedule && this.roomSchedule[day] && this.roomSchedule[day][timeSlot]) {
+      if (this.roomSchedule[day][timeSlot].has(room.id)) {
+        conflicts.push({
+          type: 'ROOM_CONFLICT',
+          severity: 'HIGH',
+          message: `Room ${room.room_name} is already occupied`,
+          conflictingEntry: { roomId: room.id, day, timeSlot }
+        });
+      }
+    }
+
+    if (this.groupSchedule && this.groupSchedule[day] && this.groupSchedule[day][timeSlot]) {
+      if (this.groupSchedule[day][timeSlot].has(group.id)) {
+        conflicts.push({
+          type: 'GROUP_CONFLICT',
+          severity: 'HIGH',
+          message: `Group ${group.group_name} is already scheduled`,
+          conflictingEntry: { groupId: group.id, day, timeSlot }
+        });
+      }
+    }
+
+    if (room.capacity && group.strength && room.capacity < group.strength) {
+      conflicts.push({
+        type: 'CAPACITY_CONFLICT',
+        severity: 'MEDIUM',
+        message: `Room capacity (${room.capacity}) is insufficient for group strength (${group.strength})`,
+        details: { capacity: room.capacity, groupSize: group.strength }
+      });
+    }
+
+    if (subject.course_type === 'Lab' && room.room_type !== 'Lab') {
+      conflicts.push({
+        type: 'ROOM_TYPE_CONFLICT',
+        severity: 'MEDIUM',
+        message: `Subject requires Lab but room type is ${room.room_type}`,
+        details: { required: 'Lab', actual: room.room_type }
+      });
+    }
+
+    return conflicts;
+  }
+}
+
+module.exports = { ConflictDetector };

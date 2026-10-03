@@ -1,0 +1,598 @@
+const { sendSuccess } = require('../../utils/response');
+const { query } = require('../../config/db');
+const { asyncHandler, ApiError } = require('../../middleware/errorHandler');
+const { logger } = require('../../config/db');
+const notificationService = require('../../services/notification.service');
+const activityService = require('../../services/activity.service');
+
+/**
+ * Events Controller
+ * Handles all event-related HTTP requests
+ */
+
+/**
+ * Create a new event (Admin only)
+ * POST /api/events
+ */
+const createEvent = asyncHandler(async (req, res) => {
+  const {
+    title,
+    description,
+    location,
+    start_time,
+    end_time,
+    club_id,
+    target_department,
+    is_featured,
+    tags,
+  } = req.body;
+
+  // If multer saved a file, build the public URL; otherwise null
+  const image_url = req.file
+    ? `${req.protocol}://${req.get('host')}/uploads/${req.file.filename}`
+    : null;
+
+  const sql = `
+    INSERT INTO events (title, description, location, start_time, end_time, club_id, target_department, is_featured, tags, image_url)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+    RETURNING *
+  `;
+
+  const values = [
+    title,
+    description,
+    location,
+    start_time,
+    end_time,
+    club_id,
+    target_department,
+    is_featured || false,
+    tags,
+    image_url,
+  ];
+
+  const result = await query(sql, values);
+
+  if (!result.rows || result.rows.length === 0) {
+    throw new ApiError(500, 'Failed to create event');
+  }
+
+  logger.info('Event created', { eventId: result.rows[0].id, createdBy: req.user.id });
+
+  notificationService.broadcast('EVENT_CREATED', {
+  message: `New event: ${result.rows[0].title}`,
+});
+
+await notificationService.notifyRole({
+    role: 'student',
+    eventType: 'EVENT_CREATED',
+    title: 'New Campus Event',
+    message: `New event: ${result.rows[0].title}`,
+    metadata: { eventId: result.rows[0].id },
+    socketEvent: 'EVENT_CREATED',
+    socketPayload: {
+      message: `New event: ${result.rows[0].title}`,
+      event: result.rows[0]
+    },
+    sendEmail: true,
+  });
+
+  await activityService.logActivity({
+    userId: req.user.id,
+    action: 'CREATE_EVENT',
+    entityType: 'event',
+    entityId: result.rows[0].id,
+    description: `Created new event: ${result.rows[0].title}`,
+    metadata: { title: result.rows[0].title }
+  });
+
+
+  sendSuccess(res, 201, 'Event created successfully', {
+    event: result.rows[0],
+  });
+
+});
+
+/**
+ * Get all events with filtering
+ * GET /api/events
+ * Public route
+ */
+const getAllEvents = asyncHandler(async (req, res) => {
+  const {
+    search,
+    tag,
+    club_id,
+    department,
+    is_featured,
+    upcoming,
+    page = 1,
+    limit = 10,
+    sort = 'start_time',
+    order = 'ASC',
+  } = req.query;
+
+  const pageNum = parseInt(page);
+  const limitNum = parseInt(limit);
+
+  // Validate parsed integers
+  if (isNaN(pageNum) || pageNum < 1) {
+    throw new ApiError(400, 'Invalid page number');
+  }
+  if (isNaN(limitNum) || limitNum < 1 || limitNum > 100) {
+    throw new ApiError(400, 'Invalid limit. Must be between 1 and 100');
+  }
+
+  const offset = (pageNum - 1) * limitNum;
+
+  const allowedSortFields = ['start_time', 'title', 'created_at'];
+  const allowedOrders = ['ASC', 'DESC'];
+  const sortField = allowedSortFields.includes(sort) ? sort : 'start_time';
+  const sortOrder = allowedOrders.includes(order.toUpperCase()) ? order.toUpperCase() : 'ASC';
+
+  // Map allowed sort fields to fully-qualified, safe SQL identifiers.
+  const sortFieldMap = {
+    start_time: 'e.start_time',
+    title: 'e.title',
+    created_at: 'e.created_at',
+  };
+
+  // Ensure we always use a safe, whitelisted column name for ORDER BY.
+  const safeSortField = sortFieldMap[sortField] || 'e.start_time';
+  
+  let sql = 'SELECT e.*, c.name as club_name, COUNT(*) OVER() as total_count FROM events e LEFT JOIN clubs c ON e.club_id = c.id WHERE e.deleted_at IS NULL';
+  const values = [];
+  let paramCounter = 1;
+
+  // Search by title or description
+  if (search) {
+    sql += ` AND (e.title ILIKE $${paramCounter} OR e.description ILIKE $${paramCounter})`;
+    values.push(`%${search}%`);
+    paramCounter++;
+  }
+
+  // Filter by tag
+  if (tag) {
+    sql += ` AND $${paramCounter} = ANY(e.tags)`;
+    values.push(tag);
+    paramCounter++;
+  }
+
+  // Filter by club
+  if (club_id) {
+    const clubIdNum = parseInt(club_id);
+    if (isNaN(clubIdNum) || clubIdNum < 1) {
+      throw new ApiError(400, 'Invalid club ID');
+    }
+    sql += ` AND e.club_id = $${paramCounter}`;
+    values.push(clubIdNum);
+    paramCounter++;
+  }
+
+  // Filter by department
+  if (department) {
+    sql += ` AND (e.target_department = $${paramCounter} OR e.target_department IS NULL)`;
+    values.push(department);
+    paramCounter++;
+  }
+
+  // Filter featured events
+  if (is_featured === 'true') {
+    sql += ' AND e.is_featured = true';
+  }
+
+  // Filter upcoming events only
+  if (upcoming === 'true') {
+    sql += ' AND e.start_time > NOW()';
+  }
+
+  sql += ` ORDER BY ${safeSortField} ${sortOrder}`;
+  sql += ` LIMIT $${paramCounter} OFFSET $${paramCounter + 1}`;
+  values.push(limitNum, offset);
+
+  const result = await query(sql, values);
+  const total = result.rows.length > 0 ? parseInt(result.rows[0].total_count) : 0;
+  
+  sendSuccess(res, 200, 'Events fetched successfully', {
+    events: result.rows,
+    pagination: {
+      page: pageNum,
+      limit: limitNum,
+      total,
+      totalPages: Math.ceil(total / limitNum),
+    },
+  });
+});
+
+/**
+ * Get single event by ID
+ * GET /api/events/:id
+ * Public route
+ */
+const getEventById = asyncHandler(async (req, res) => {
+  const { id } = req.params;
+
+  const eventId = parseInt(id);
+  if (isNaN(eventId) || eventId < 1) {
+    throw new ApiError(400, 'Invalid event ID');
+  }
+
+  const sql = `
+    SELECT e.*, c.name as club_name, c.description as club_description
+    FROM events e
+    LEFT JOIN clubs c ON e.club_id = c.id
+    WHERE e.id = $1 AND e.deleted_at IS NULL
+  `;
+
+  const result = await query(sql, [eventId]);
+
+  if (result.rows.length === 0) {
+    throw new ApiError(404, 'Event not found');
+  }
+
+  sendSuccess(res, 200, 'Event fetched successfully', {
+    event: result.rows[0],
+  });
+});
+
+/**
+ * Update an event (Admin only)
+ * PUT /api/events/:id
+ */
+const updateEvent = asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  const {
+    title,
+    description,
+    location,
+    start_time,
+    end_time,
+    club_id,
+    target_department,
+    is_featured,
+    tags,
+  } = req.body;
+
+  const eventId = parseInt(id);
+  if (isNaN(eventId) || eventId < 1) {
+    throw new ApiError(400, 'Invalid event ID');
+  }
+
+  // Only update image_url if a new file was uploaded
+  const image_url = req.file
+    ? `${req.protocol}://${req.get('host')}/uploads/${req.file.filename}`
+    : undefined;
+
+  // Build SET clause dynamically so image_url is only touched when a new file arrives
+  const sql = image_url
+    ? `UPDATE events
+       SET title=$1, description=$2, location=$3, start_time=$4, end_time=$5,
+           club_id=$6, target_department=$7, is_featured=$8, tags=$9, image_url=$10
+       WHERE id=$11 AND deleted_at IS NULL RETURNING *`
+    : `UPDATE events
+       SET title=$1, description=$2, location=$3, start_time=$4, end_time=$5,
+           club_id=$6, target_department=$7, is_featured=$8, tags=$9
+       WHERE id=$10 AND deleted_at IS NULL RETURNING *`;
+
+  const values = image_url
+    ? [title, description, location, start_time, end_time, club_id, target_department, is_featured, tags, image_url, eventId]
+    : [title, description, location, start_time, end_time, club_id, target_department, is_featured, tags, eventId];
+
+  const result = await query(sql, values);
+
+  if (result.rows.length === 0) {
+    throw new ApiError(404, 'Event not found');
+  }
+
+  logger.info('Event updated', { eventId: id, updatedBy: req.user.id });
+
+  notificationService.broadcast('EVENT_UPDATED', {
+  message: `Event updated: ${result.rows[0].title}`,
+});
+
+await notificationService.notifyRole({
+    role: 'student',
+    eventType: 'EVENT_UPDATED',
+    title: 'Campus Event Updated',
+    message: `Event updated: ${result.rows[0].title}`,
+    metadata: { eventId: result.rows[0].id },
+    socketEvent: 'EVENT_UPDATED',
+    socketPayload: {
+      message: `Event updated: ${result.rows[0].title}`,
+      event: result.rows[0]
+    },
+    sendEmail: true,
+  });
+
+  sendSuccess(res, 200, 'Event updated successfully', {
+    event: result.rows[0],
+  });
+});
+
+/**
+ * Delete an event (Admin only)
+ * DELETE /api/events/:id
+ */
+const deleteEvent = asyncHandler(async (req, res) => {
+  const { id } = req.params;
+
+  const eventId = parseInt(id);
+  if (isNaN(eventId) || eventId < 1) {
+    throw new ApiError(400, 'Invalid event ID');
+  }
+
+  const result = await query(
+    'UPDATE events SET deleted_at = NOW() WHERE id = $1 AND deleted_at IS NULL RETURNING *',
+    [eventId],
+  );
+
+  if (result.rowCount === 0) {
+    throw new ApiError(404, 'Event not found');
+  }
+
+  logger.info('Event soft-deleted', { eventId: id, deletedBy: req.user.id });
+
+  sendSuccess(res, 200, 'Event deleted successfully');
+});
+
+/**
+ * Save an event for a user (Protected)
+ * POST /api/events/:id/save
+ */
+const saveEvent = asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  const userId = req.user.id;
+
+  const eventId = parseInt(id);
+  if (isNaN(eventId) || eventId < 1) {
+    throw new ApiError(400, 'Invalid event ID');
+  }
+
+  // Check if event exists and is not soft-deleted
+  const eventCheck = await query('SELECT id FROM events WHERE id = $1 AND deleted_at IS NULL', [
+    eventId,
+  ]);
+  if (eventCheck.rows.length === 0) {
+    throw new ApiError(404, 'Event not found');
+  }
+
+  // Check if already saved
+  const existingCheck = await query(
+    'SELECT * FROM saved_events WHERE user_id = $1 AND event_id = $2',
+    [userId, eventId],
+  );
+
+  if (existingCheck.rows.length > 0) {
+    throw new ApiError(400, 'Event already saved');
+  }
+
+  // Save the event
+  await query('INSERT INTO saved_events (user_id, event_id) VALUES ($1, $2)', [
+    userId,
+    eventId,
+  ]);
+
+  logger.info('Event saved', { eventId: id, userId });
+
+  await activityService.logActivity({
+    userId,
+    action: 'SAVE_EVENT',
+    entityType: 'event',
+    entityId: eventId,
+    description: `Saved event: ${eventCheck.rows[0].id}`,
+    metadata: { eventId }
+  });
+
+
+  sendSuccess(res, 200, 'Event saved successfully');
+});
+
+/**
+ * Unsave an event (Protected)
+ * DELETE /api/events/:id/save
+ */
+const unsaveEvent = asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  const userId = req.user.id;
+
+  const eventId = parseInt(id);
+  if (isNaN(eventId) || eventId < 1) {
+    throw new ApiError(400, 'Invalid event ID');
+  }
+
+  const result = await query(
+    'DELETE FROM saved_events WHERE user_id = $1 AND event_id = $2 RETURNING *',
+    [userId, eventId],
+  );
+
+  if (result.rowCount === 0) {
+    throw new ApiError(404, 'Event not in saved list');
+  }
+
+  logger.info('Event unsaved', { eventId: id, userId });
+
+  sendSuccess(res, 200, 'Event removed from saved list');
+});
+
+/**
+ * Get user's saved events (Protected)
+ * GET /api/events/saved
+ */
+const getSavedEvents = asyncHandler(async (req, res) => {
+  const userId = req.user.id;
+
+  const sql = `
+    SELECT e.*, c.name as club_name, se.saved_at
+    FROM saved_events se
+    JOIN events e ON se.event_id = e.id
+    LEFT JOIN clubs c ON e.club_id = c.id
+    WHERE se.user_id = $1 AND e.deleted_at IS NULL
+    ORDER BY e.start_time ASC
+  `;
+
+  const result = await query(sql, [userId]);
+
+  sendSuccess(res, 200, 'Saved events fetched successfully', {
+    events: result.rows,
+    count: result.rows.length,
+  });
+});
+/**
+ * RSVP or Waitlist for an Event (Protected)
+ * POST /api/events/:id/rsvp
+ */
+const rsvpToEvent = asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  const userId = req.user.id;
+
+  const eventId = parseInt(id);
+  if (isNaN(eventId) || eventId < 1) {
+    throw new ApiError(400, 'Invalid event ID');
+  }
+
+  // 1. Fetch Event and its Max Capacity
+  const eventCheck = await query('SELECT id, title, max_capacity FROM events WHERE id = $1 AND deleted_at IS NULL', [eventId]);
+  if (eventCheck.rows.length === 0) {
+    throw new ApiError(404, 'Event not found');
+  }
+  
+  const event = eventCheck.rows[0];
+  // Default max_capacity to 50 if it's null/not specified dynamically
+  const maxCapacity = event.max_capacity || 50; 
+
+  // 2. Check if user has ALREADY requested RSVP/Waitlist to prevent duplicates
+  const duplicateCheck = await query(
+    'SELECT status FROM event_rsvps WHERE user_id = $1 AND event_id = $2',
+    [userId, eventId]
+  );
+  if (duplicateCheck.rows.length > 0) {
+    throw new ApiError(400, `You have already registered for this event. Status: ${duplicateCheck.rows[0].status}`);
+  }
+
+  // 3. Count current 'confirmed' reservations
+  const countCheck = await query(
+    "SELECT COUNT(*)::int as total FROM event_rsvps WHERE event_id = $1 AND status = 'confirmed'",
+    [eventId]
+  );
+  const currentConfirmedCount = countCheck.rows[0].total;
+
+  // 4. Conditional State Engine Assignment
+  let rsvpStatus = 'confirmed';
+  if (currentConfirmedCount >= maxCapacity) {
+    rsvpStatus = 'waitlisted';
+  }
+
+  // 5. Insert Record inside PostgreSQL Database
+  const insertSql = `
+    INSERT INTO event_rsvps (user_id, event_id, status)
+    VALUES ($1, $2, $3)
+    RETURNING id, status, created_at
+  `;
+  const insertResult = await query(insertSql, [userId, eventId, rsvpStatus]);
+
+  logger.info('Event RSVP processed', { eventId, userId, status: rsvpStatus });
+
+  // 6. Log Dynamic Tracking Activity Logs
+  await activityService.logActivity({
+    userId,
+    action: rsvpStatus === 'confirmed' ? 'CONFIRM_RSVP' : 'JOIN_WAITLIST',
+    entityType: 'event_rsvp',
+    entityId: insertResult.rows[0].id,
+    description: rsvpStatus === 'confirmed' 
+      ? `Successfully confirmed seat for event: ${event.title}`
+      : `Added to the waitlist queue for full event: ${event.title}`,
+    metadata: { eventId, status: rsvpStatus }
+  });
+
+  // 7. Dispatch Network Status Array Response
+  sendSuccess(res, 201, rsvpStatus === 'confirmed' ? 'RSVP confirmed successfully' : 'Event full! You have been added to the waitlist', {
+    rsvp: insertResult.rows[0]
+  });
+});
+
+/**
+ * Cancel RSVP for an Event (Protected)
+ * DELETE /api/events/:id/rsvp
+ */
+const cancelRsvpToEvent = asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  const userId = req.user.id;
+
+  const eventId = parseInt(id);
+  if (isNaN(eventId) || eventId < 1) {
+    throw new ApiError(400, 'Invalid event ID');
+  }
+
+  // 1. Fetch Event
+  const eventCheck = await query('SELECT id, title FROM events WHERE id = $1 AND deleted_at IS NULL', [eventId]);
+  if (eventCheck.rows.length === 0) {
+    throw new ApiError(404, 'Event not found');
+  }
+  const event = eventCheck.rows[0];
+
+  // 2. Check if RSVP exists
+  const rsvpCheck = await query(
+    'SELECT id, status FROM event_rsvps WHERE user_id = $1 AND event_id = $2',
+    [userId, eventId]
+  );
+  if (rsvpCheck.rows.length === 0) {
+    throw new ApiError(400, 'You are not registered for this event');
+  }
+  const rsvp = rsvpCheck.rows[0];
+
+  // 3. Delete the RSVP record
+  await query('DELETE FROM event_rsvps WHERE user_id = $1 AND event_id = $2', [userId, eventId]);
+
+  logger.info('Event RSVP cancelled', { eventId, userId });
+
+  // 4. Log Dynamic Tracking Activity Logs
+  await activityService.logActivity({
+    userId,
+    action: 'CANCEL_RSVP',
+    entityType: 'event_rsvp',
+    entityId: rsvp.id,
+    description: `Successfully cancelled registration for event: ${event.title}`,
+    metadata: { eventId, status: rsvp.status }
+  });
+
+  // 5. Send Success response
+  sendSuccess(res, 200, 'Registration cancelled successfully');
+});
+
+/**
+ * Restore a soft-deleted event (Admin only)
+ * POST /api/events/:id/restore
+ */
+const restoreEvent = asyncHandler(async (req, res) => {
+  const eventId = parseInt(req.params.id);
+  if (isNaN(eventId) || eventId < 1) {
+    throw new ApiError(400, 'Invalid event ID');
+  }
+
+  const result = await query(
+    'UPDATE events SET deleted_at = NULL WHERE id = $1 AND deleted_at IS NOT NULL RETURNING *',
+    [eventId],
+  );
+
+  if (result.rowCount === 0) {
+    throw new ApiError(404, 'Event not found or not deleted');
+  }
+
+  logger.info('Event restored', { eventId, restoredBy: req.user.id });
+
+  sendSuccess(res, 200, 'Event restored successfully', { event: result.rows[0] });
+});
+
+module.exports = {
+  createEvent,
+  getAllEvents,
+  getEventById,
+  updateEvent,
+  deleteEvent,
+  restoreEvent,
+  saveEvent,
+  unsaveEvent,
+  getSavedEvents,
+  rsvpToEvent,
+  cancelRsvpToEvent,
+};
